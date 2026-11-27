@@ -509,6 +509,285 @@ bbr_log_pacing_delay_calc(struct tcp_bbr *bbr, uint16_t gain, uint32_t len,
 			  uint32_t override, int mod);
 static int bbr_ctloutput(struct tcpcb *tp, struct sockopt *sopt);
 
+/*
+ * DTrace probes for following a connection that stops sending.  Every probe
+ * passes the tcpcb, a snapshot of the stack's state and four values of its
+ * own.  The snapshot is filled only while the probe is enabled.
+ */
+
+/* Why bbr_output_wtime() returned without sending: arg2 of nosend. */
+#define	BBR_SDT_NS_NONE			0	/* window, cwnd or buffer */
+#define	BBR_SDT_NS_TIMER_PENDING	1	/* timer pending, nothing new */
+#define	BBR_SDT_NS_PACER		2	/* paced output not yet due */
+#define	BBR_SDT_NS_TIMER_DONE		3	/* a timer ended the call */
+#define	BBR_SDT_NS_TFO			4	/* fast open handshake */
+#define	BBR_SDT_NS_NOMEM		5	/* no send map entry */
+#define	BBR_SDT_NS_MAPLIMIT		6	/* send map entry limit */
+#define	BBR_SDT_NS_SMALL		7	/* under a pacing segment */
+#define	BBR_SDT_NS_RWND_SMALL		8	/* peer window too small */
+#define	BBR_SDT_NS_CWND_SMALL		9	/* cwnd room too small */
+#define	BBR_SDT_NS_RWND_FULL		10	/* peer window filled */
+#define	BBR_SDT_NS_PERSIST_WAIT		11	/* persist, window small */
+#define	BBR_SDT_NS_FIN_WAIT		12	/* FIN held behind data */
+
+/* Why an inbound segment was dropped: arg2 of input-drop. */
+#define	BBR_SDT_ID_GHOST_ACK		1
+#define	BBR_SDT_ID_OLD_ACK		2
+#define	BBR_SDT_ID_ACK_ABOVE_MAX	3
+#define	BBR_SDT_ID_NO_TSTAMP		4
+#define	BBR_SDT_ID_SYN_FIN		5
+
+/* Why bbr_fastack() left an ACK to the slow path: arg2 of fastack-bail. */
+#define	BBR_SDT_FA_OLD_ACK		1
+#define	BBR_SDT_FA_ABOVE_MAX		2
+#define	BBR_SDT_FA_ZERO_WND		3
+#define	BBR_SDT_FA_NEED_SYN_FIN		4
+#define	BBR_SDT_FA_TS_BEHIND		5
+#define	BBR_SDT_FA_RECOVERY		6
+#define	BBR_SDT_FA_RESEND		7
+#define	BBR_SDT_FA_PERSIST		8
+#define	BBR_SDT_FA_SACKED		9
+
+#ifdef KDTRACE_HOOKS
+#define	BBR_SDT_VERSION		1
+#define	BBR_SDT_MAGIC		0x42425253
+
+/*
+ * Fixed-width members, widest first and aligned throughout, so the layout
+ * has no padding.  A D script declares the same layout and checks magic and
+ * size against it.
+ */
+struct bbr_sdt_state {
+	uint64_t bw_filter;
+	uint64_t bw_cur;
+	uint64_t bw_lt;
+	uint32_t version;
+	uint32_t cts;
+	uint32_t iss;
+	uint32_t snd_una;
+	uint32_t snd_max;
+	uint32_t snd_nxt;
+	uint32_t snd_wnd;
+	uint32_t snd_cwnd;
+	uint32_t max_sndwnd;
+	uint32_t high_rwnd;
+	uint32_t flight;
+	uint32_t sb_avail;
+	uint32_t sacked;
+	uint32_t lost_bytes;
+	uint32_t lost;
+	uint32_t holes_rxt;
+	uint32_t delivered;
+	uint32_t app_limited_until;
+	uint32_t rtt_prop;
+	uint32_t srtt;
+	uint32_t last_rtt;
+	uint32_t rxtcur;
+	uint32_t timer_exp;
+	uint32_t pacer_started;
+	uint32_t last_delay;
+	uint32_t agg_delay;
+	uint32_t agg_early;
+	uint32_t target;
+	uint32_t pace_max_segs;
+	uint32_t rcvtime;
+	uint32_t state_time;
+	uint32_t rtt_shrinks;
+	uint32_t probertt_int;
+	uint32_t enters_probertt;
+	uint32_t pkt_epoch;
+	uint32_t maps_alloced;
+	uint32_t t_flags;
+	uint32_t t_flags2;
+	uint16_t lport;
+	uint16_t fport;
+	uint16_t hpts_flags;
+	uint16_t pacing_gain;
+	uint16_t cwnd_gain;
+	uint16_t maxseg;
+	uint16_t tlp_cnt;
+	uint16_t pace_min_segs;
+	uint8_t t_state;
+	uint8_t rxtshift;
+	uint8_t bbr_state;
+	uint8_t bbr_substate;
+	uint8_t in_persist;
+	uint8_t in_recovery;
+	uint8_t in_hpts;
+	uint8_t timer_first;
+	uint8_t tmr_stopped;
+	uint8_t all_stopped;
+	uint8_t timer_override;
+	uint8_t wanted_output;
+	uint8_t cwnd_limited;
+	uint8_t has_collapsed;
+	uint8_t resend;
+	uint8_t tlp_send;
+	uint8_t tlp_in_progress;
+	uint8_t tlp_rtx_out;
+	uint8_t tlp_new_data;
+	uint8_t lt_use_bw;
+	uint8_t lt_sampling;
+	uint8_t use_google;
+	uint8_t filled_pipe;
+	uint8_t no_pacing;
+	uint8_t oerror_cnt;
+	uint8_t output_error_seen;
+	uint8_t pkt_conservation;
+	uint8_t recovery_bw;
+	uint8_t timer_src;
+	uint8_t past_init_win;
+	uint8_t prev_in_rec;
+	uint8_t spare;
+	uint32_t magic;
+	uint32_t size;
+};
+_Static_assert(sizeof(struct bbr_sdt_state) == 232,
+    "struct bbr_sdt_state has padding");
+
+SDT_PROVIDER_DEFINE(bbr);
+
+#define	BBR_SDT_DEFINE(probe)						\
+	SDT_PROBE_DEFINE6(bbr, , , probe, "struct tcpcb *",		\
+	    "struct bbr_sdt_state *", "uintptr_t", "uintptr_t",		\
+	    "uintptr_t", "uintptr_t")
+
+BBR_SDT_DEFINE(conn__init);
+BBR_SDT_DEFINE(conn__fini);
+BBR_SDT_DEFINE(input);
+BBR_SDT_DEFINE(input__done);
+BBR_SDT_DEFINE(input__drop);
+BBR_SDT_DEFINE(fastack__bail);
+BBR_SDT_DEFINE(output);
+BBR_SDT_DEFINE(nosend);
+BBR_SDT_DEFINE(send);
+BBR_SDT_DEFINE(output__error);
+BBR_SDT_DEFINE(timer__start);
+BBR_SDT_DEFINE(timer__busy);
+BBR_SDT_DEFINE(timer__cancel);
+BBR_SDT_DEFINE(timer__check);
+BBR_SDT_DEFINE(timeout);
+BBR_SDT_DEFINE(persist);
+BBR_SDT_DEFINE(state__change);
+BBR_SDT_DEFINE(rtt__shrinks);
+BBR_SDT_DEFINE(cwnd);
+BBR_SDT_DEFINE(rwnd__collapse);
+BBR_SDT_DEFINE(lt__bw);
+BBR_SDT_DEFINE(recovery__enter);
+BBR_SDT_DEFINE(recovery__exit);
+
+/*
+ * The snapshot lives on this frame, so the instrumented functions carry no
+ * extra stack.  BBR_SDT() reaches it through sdt.h's _SDT_PROBE().
+ */
+static __noinline void
+bbr_sdt_fire(uint32_t id, struct tcp_bbr *bbr, uint32_t cts, uintptr_t a2,
+    uintptr_t a3, uintptr_t a4, uintptr_t a5)
+{
+	struct bbr_sdt_state st;
+	struct tcpcb *tp;
+	struct inpcb *inp;
+	struct socket *so;
+
+	tp = bbr->rc_tp;
+	inp = tptoinpcb(tp);
+	so = tptosocket(tp);
+	st.bw_filter = get_filter_value(&bbr->r_ctl.rc_delrate);
+	st.bw_cur = bbr->r_ctl.rc_bbr_cur_del_rate;
+	st.bw_lt = bbr->r_ctl.rc_lt_bw;
+	st.version = BBR_SDT_VERSION;
+	st.cts = cts;
+	st.iss = tp->iss;
+	st.snd_una = tp->snd_una;
+	st.snd_max = tp->snd_max;
+	st.snd_nxt = tp->snd_nxt;
+	st.snd_wnd = tp->snd_wnd;
+	st.snd_cwnd = tp->snd_cwnd;
+	st.max_sndwnd = tp->max_sndwnd;
+	st.high_rwnd = bbr->r_ctl.rc_high_rwnd;
+	st.flight = ctf_flight_size(tp,
+	    bbr->r_ctl.rc_sacked + bbr->r_ctl.rc_lost_bytes);
+	st.sb_avail = (so != NULL && !SOLISTENING(so)) ?
+	    sbavail(&so->so_snd) : 0;
+	st.sacked = bbr->r_ctl.rc_sacked;
+	st.lost_bytes = bbr->r_ctl.rc_lost_bytes;
+	st.lost = bbr->r_ctl.rc_lost;
+	st.holes_rxt = bbr->r_ctl.rc_holes_rxt;
+	st.delivered = bbr->r_ctl.rc_delivered;
+	st.app_limited_until = bbr->r_ctl.r_app_limited_until;
+	st.rtt_prop = get_filter_value_small(&bbr->r_ctl.rc_rttprop);
+	st.srtt = TICKS_2_USEC(tp->t_srtt) >> TCP_RTT_SHIFT;
+	st.last_rtt = bbr->r_ctl.rc_last_rtt;
+	st.rxtcur = TICKS_2_USEC(tp->t_rxtcur);
+	st.timer_exp = bbr->r_ctl.rc_timer_exp;
+	st.pacer_started = bbr->rc_pacer_started;
+	st.last_delay = bbr->r_ctl.rc_last_delay_val;
+	st.agg_delay = bbr->r_ctl.rc_hptsi_agg_delay;
+	st.agg_early = bbr->r_ctl.rc_agg_early;
+	st.target = bbr->r_ctl.rc_target_at_state;
+	st.pace_max_segs = bbr->r_ctl.rc_pace_max_segs;
+	st.rcvtime = bbr->r_ctl.rc_rcvtime;
+	st.state_time = bbr->r_ctl.rc_bbr_state_time;
+	st.rtt_shrinks = bbr->r_ctl.rc_rtt_shrinks;
+	st.probertt_int = bbr->r_ctl.rc_probertt_int;
+	st.enters_probertt = bbr->r_ctl.rc_bbr_enters_probertt;
+	st.pkt_epoch = bbr->r_ctl.rc_pkt_epoch;
+	st.maps_alloced = bbr->r_ctl.rc_num_maps_alloced;
+	st.t_flags = tp->t_flags;
+	st.t_flags2 = tp->t_flags2;
+	st.lport = ntohs(inp->inp_lport);
+	st.fport = ntohs(inp->inp_fport);
+	st.hpts_flags = bbr->r_ctl.rc_hpts_flags;
+	st.pacing_gain = bbr->r_ctl.rc_bbr_hptsi_gain;
+	st.cwnd_gain = bbr->r_ctl.rc_bbr_cwnd_gain;
+	st.maxseg = tp->t_maxseg;
+	st.tlp_cnt = bbr->r_ctl.rc_tlp_seg_send_cnt;
+	st.pace_min_segs = bbr->r_ctl.rc_pace_min_segs;
+	st.t_state = tp->t_state;
+	st.rxtshift = tp->t_rxtshift;
+	st.bbr_state = bbr->rc_bbr_state;
+	st.bbr_substate = bbr->rc_bbr_substate;
+	st.in_persist = bbr->rc_in_persist;
+	st.in_recovery = IN_RECOVERY(tp->t_flags) != 0;
+	st.in_hpts = tcp_in_hpts(tp);
+	st.timer_first = bbr->rc_timer_first;
+	st.tmr_stopped = bbr->rc_tmr_stopped;
+	st.all_stopped = bbr->rc_all_timers_stopped;
+	st.timer_override = bbr->r_timer_override;
+	st.wanted_output = bbr->r_wanted_output;
+	st.cwnd_limited = bbr->rc_cwnd_limited;
+	st.has_collapsed = bbr->rc_has_collapsed;
+	st.resend = bbr->r_ctl.rc_resend != NULL;
+	st.tlp_send = bbr->r_ctl.rc_tlp_send != NULL;
+	st.tlp_in_progress = bbr->rc_tlp_in_progress;
+	st.tlp_rtx_out = bbr->rc_tlp_rtx_out;
+	st.tlp_new_data = bbr->rc_tlp_new_data;
+	st.lt_use_bw = bbr->rc_lt_use_bw;
+	st.lt_sampling = bbr->rc_lt_is_sampling;
+	st.use_google = bbr->rc_use_google;
+	st.filled_pipe = bbr->rc_filled_pipe;
+	st.no_pacing = bbr->rc_no_pacing;
+	st.oerror_cnt = bbr->oerror_cnt;
+	st.output_error_seen = bbr->output_error_seen;
+	st.pkt_conservation = bbr->pkt_conservation;
+	st.recovery_bw = bbr->r_recovery_bw;
+	st.timer_src = bbr->bbr_timer_src;
+	st.past_init_win = bbr->rc_past_init_win;
+	st.prev_in_rec = bbr->bbr_prev_in_rec;
+	st.spare = 0;
+	st.magic = BBR_SDT_MAGIC;
+	st.size = sizeof(st);
+	sdt_probe6(id, (uintptr_t)tp, (uintptr_t)&st, a2, a3, a4, a5);
+}
+
+#define	BBR_SDT(probe, p, c, a2, a3, a4, a5)				\
+	_SDT_PROBE(bbr, , , probe, __COUNTER__, bbr_sdt_fire, (p), (c),	\
+	    (uintptr_t)(a2), (uintptr_t)(a3), (uintptr_t)(a4),		\
+	    (uintptr_t)(a5))
+#else
+#define	BBR_SDT(probe, p, c, a2, a3, a4, a5)
+#endif
+
 static inline uint8_t
 bbr_state_val(struct tcp_bbr *bbr)
 {
@@ -727,6 +1006,7 @@ bbr_start_hpts_timer(struct tcp_bbr *bbr, struct tcpcb *tp, uint32_t cts, int32_
 {
 	struct inpcb *inp = tptoinpcb(tp);
 	struct hpts_diag diag;
+	struct hpts_diag *diagp __sdt_used = NULL;
 	uint32_t delayed_ack = 0;
 	uint32_t left = 0;
 	uint32_t hpts_timeout;
@@ -736,6 +1016,7 @@ bbr_start_hpts_timer(struct tcp_bbr *bbr, struct tcpcb *tp, uint32_t cts, int32_
 
 	if (tcp_in_hpts(tp)) {
 		/* A previous call is already set up */
+		BBR_SDT(timer__busy, bbr, cts, frm, slot, 0, 0);
 		return;
 	}
 	if ((tp->t_state == TCPS_CLOSED) ||
@@ -901,6 +1182,7 @@ bbr_start_hpts_timer(struct tcp_bbr *bbr, struct tcpcb *tp, uint32_t cts, int32_
 
 		(void)tcp_hpts_insert_diag(tp, HPTS_USEC_TO_SLOTS(slot),
 					   __LINE__, &diag);
+		diagp = &diag;
 		bbr->rc_timer_first = 0;
 		bbr->bbr_timer_src = frm;
 		bbr_log_to_start(bbr, cts, hpts_timeout, slot, 1);
@@ -908,6 +1190,7 @@ bbr_start_hpts_timer(struct tcp_bbr *bbr, struct tcpcb *tp, uint32_t cts, int32_
 	} else if (hpts_timeout) {
 		(void)tcp_hpts_insert_diag(tp, HPTS_USEC_TO_SLOTS(hpts_timeout),
 					   __LINE__, &diag);
+		diagp = &diag;
 		/*
 		 * We add the flag here as well if the slot is set,
 		 * since hpts will call in to clear the queue first before
@@ -941,6 +1224,7 @@ bbr_start_hpts_timer(struct tcp_bbr *bbr, struct tcpcb *tp, uint32_t cts, int32_
 	}
 	bbr->rc_tmr_stopped = 0;
 	bbr_log_type_bbrsnd(bbr, tot_len, slot, delay_calc, cts, frm, prev_delay);
+	BBR_SDT(timer__start, bbr, cts, frm, slot, hpts_timeout, diagp);
 }
 
 static void
@@ -1894,6 +2178,8 @@ bbr_log_type_bw_reduce(struct tcp_bbr *bbr, int reason)
 static void
 bbr_log_type_rwnd_collapse(struct tcp_bbr *bbr, int seq, int mode, uint32_t count)
 {
+	BBR_SDT(rwnd__collapse, bbr, bbr->r_ctl.rc_rcvtime, mode, (uint32_t)seq,
+	    count, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -1938,6 +2224,7 @@ bbr_log_type_just_return(struct tcp_bbr *bbr, uint32_t cts, uint32_t tlen, uint8
 static void
 bbr_log_type_enter_rec(struct tcp_bbr *bbr, uint32_t seq)
 {
+	BBR_SDT(recovery__enter, bbr, bbr->r_ctl.rc_rcvtime, seq, 0, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2065,6 +2352,7 @@ bbr_log_set_of_state_target(struct tcp_bbr *bbr, uint32_t new_tar, int line, int
 static void
 bbr_log_type_statechange(struct tcp_bbr *bbr, uint32_t cts, int32_t line)
 {
+	BBR_SDT(state__change, bbr, cts, line, 0, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2093,6 +2381,7 @@ static void
 bbr_log_rtt_shrinks(struct tcp_bbr *bbr, uint32_t cts, uint32_t applied,
 		    uint32_t rtt, uint32_t line, uint8_t reas, uint16_t cond)
 {
+	BBR_SDT(rtt__shrinks, bbr, cts, reas, line, applied, rtt);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2116,6 +2405,7 @@ bbr_log_rtt_shrinks(struct tcp_bbr *bbr, uint32_t cts, uint32_t applied,
 static void
 bbr_log_type_exit_rec(struct tcp_bbr *bbr)
 {
+	BBR_SDT(recovery__exit, bbr, bbr->r_ctl.rc_rcvtime, 0, 0, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2135,6 +2425,8 @@ static void
 bbr_log_type_cwndupd(struct tcp_bbr *bbr, uint32_t bytes_this_ack, uint32_t chg,
     uint32_t prev_acked, int32_t meth, uint32_t target, uint32_t th_ack, int32_t line)
 {
+	BBR_SDT(cwnd, bbr, bbr->r_ctl.rc_rcvtime, meth, target, line,
+	    bytes_this_ack);
 	if (bbr_verbose_logging && tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2185,6 +2477,7 @@ bbr_log_rtt_sample(struct tcp_bbr *bbr, uint32_t rtt, uint32_t tsin)
 static void
 bbr_log_type_pesist(struct tcp_bbr *bbr, uint32_t cts, uint32_t time_in, int32_t line, uint8_t enter_exit)
 {
+	BBR_SDT(persist, bbr, cts, enter_exit, line, time_in, 0);
 	if (bbr_verbose_logging && tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2223,6 +2516,16 @@ static void
 bbr_log_ack_event(struct tcp_bbr *bbr, struct tcphdr *th, struct tcpopt *to, uint32_t tlen,
 		  uint16_t nsegs, uint32_t cts, int32_t nxt_pkt, struct mbuf *m)
 {
+	/*
+	 * arg4: the window, which a SYN carries unscaled.  arg5: length, then
+	 * TCP flags, SACK present, more queued, segments.
+	 */
+	BBR_SDT(input, bbr, cts, th->th_seq, th->th_ack,
+	    (tcp_get_flags(th) & TH_SYN) ? th->th_win :
+	    (uint32_t)th->th_win << bbr->rc_tp->snd_scale,
+	    (uint64_t)tlen | ((uint64_t)tcp_get_flags(th) << 32) |
+	    ((uint64_t)((to->to_flags & TOF_SACK) != 0) << 44) |
+	    ((uint64_t)(nxt_pkt != 0) << 45) | ((uint64_t)nsegs << 48));
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 		struct timeval tv;
@@ -2271,6 +2574,7 @@ bbr_log_ack_event(struct tcp_bbr *bbr, struct tcphdr *th, struct tcpopt *to, uin
 static void
 bbr_log_doseg_done(struct tcp_bbr *bbr, uint32_t cts, int32_t nxt_pkt, int32_t did_out)
 {
+	BBR_SDT(input__done, bbr, cts, nxt_pkt, did_out, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2315,6 +2619,7 @@ bbr_log_enobuf_jmp(struct tcp_bbr *bbr, uint32_t len, uint32_t cts,
 static void
 bbr_log_to_processing(struct tcp_bbr *bbr, uint32_t cts, int32_t ret, int32_t timers, uint8_t hpts_calling)
 {
+	BBR_SDT(timer__check, bbr, cts, ret, timers, hpts_calling, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2337,6 +2642,7 @@ bbr_log_to_processing(struct tcp_bbr *bbr, uint32_t cts, int32_t ret, int32_t ti
 static void
 bbr_log_to_event(struct tcp_bbr *bbr, uint32_t cts, int32_t to_num)
 {
+	BBR_SDT(timeout, bbr, cts, to_num, 0, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 		uint64_t ar;
@@ -2521,6 +2827,7 @@ bbr_log_thresh_choice(struct tcp_bbr *bbr, uint32_t cts, uint32_t thresh, uint32
 static void
 bbr_log_to_cancel(struct tcp_bbr *bbr, int32_t line, uint32_t cts, uint8_t hpts_removed)
 {
+	BBR_SDT(timer__cancel, bbr, cts, line, hpts_removed, 0, 0);
 	if (tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -2655,6 +2962,7 @@ bbr_log_type_ltbw(struct tcp_bbr *bbr, uint32_t cts, int32_t reason,
 	uint32_t newbw, uint32_t obw, uint32_t diff,
 	uint32_t tim)
 {
+	BBR_SDT(lt__bw, bbr, cts, reason, newbw, obw, tim);
 	if (/*bbr_verbose_logging && */tcp_bblogging_on(bbr->rc_tp)) {
 		union tcp_log_stackspecific log;
 
@@ -7713,6 +8021,10 @@ bbr_process_ack(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				TCPSTAT_INC(tcps_rcvghostack);
 			else
 				TCPSTAT_INC(tcps_rcvacktooold);
+			BBR_SDT(input__drop, bbr, bbr->r_ctl.rc_rcvtime,
+			    ghost_ack_check ? BBR_SDT_ID_GHOST_ACK :
+			    BBR_SDT_ID_OLD_ACK, th->th_ack, seq_min,
+			    th->th_seq);
 			/* Send challenge ACK. */
 			ctf_do_dropafterack(m, tp, th, thflags, tlen, ret_val);
 			bbr->r_wanted_output = 1;
@@ -7720,6 +8032,8 @@ bbr_process_ack(struct mbuf *m, struct tcphdr *th, struct socket *so,
 		}
 	}
 	if (SEQ_GT(th->th_ack, tp->snd_max)) {
+		BBR_SDT(input__drop, bbr, bbr->r_ctl.rc_rcvtime,
+		    BBR_SDT_ID_ACK_ABOVE_MAX, th->th_ack, 0, th->th_seq);
 		ctf_do_dropafterack(m, tp, th, thflags, tlen, ret_val);
 		bbr->r_wanted_output = 1;
 		return (1);
@@ -8536,6 +8850,11 @@ bbr_do_fastnewdata(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	return (1);
 }
 
+#define	BBR_FASTACK_BAIL(why)						\
+	BBR_SDT(fastack__bail, (struct tcp_bbr *)tp->t_fb_ptr,		\
+	    ((struct tcp_bbr *)tp->t_fb_ptr)->r_ctl.rc_rcvtime, (why),	\
+	    th->th_ack, tiwin, 0)
+
 /*
  * This subfunction is used to try to highly optimize the
  * fast path. We again allow window updates that are
@@ -8559,39 +8878,48 @@ bbr_fastack(struct mbuf *m, struct tcphdr *th, struct socket *so,
 
 	if (__predict_false(SEQ_LEQ(th->th_ack, tp->snd_una))) {
 		/* Old ack, behind (or duplicate to) the last one rcv'd */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_OLD_ACK);
 		return (0);
 	}
 	if (__predict_false(SEQ_GT(th->th_ack, tp->snd_max))) {
 		/* Above what we have sent? */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_ABOVE_MAX);
 		return (0);
 	}
 	if (__predict_false(tiwin == 0)) {
 		/* zero window */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_ZERO_WND);
 		return (0);
 	}
 	if (__predict_false(tp->t_flags & (TF_NEEDSYN | TF_NEEDFIN))) {
 		/* We need a SYN or a FIN, unlikely.. */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_NEED_SYN_FIN);
 		return (0);
 	}
 	if ((to->to_flags & TOF_TS) && __predict_false(TSTMP_LT(to->to_tsval, tp->ts_recent))) {
 		/* Timestamp is behind .. old ack with seq wrap? */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_TS_BEHIND);
 		return (0);
 	}
 	if (__predict_false(IN_RECOVERY(tp->t_flags))) {
 		/* Still recovering */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_RECOVERY);
 		return (0);
 	}
 	bbr = (struct tcp_bbr *)tp->t_fb_ptr;
 	if (__predict_false(bbr->r_ctl.rc_resend != NULL)) {
 		/* We are retransmitting */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_RESEND);
 		return (0);
 	}
 	if (__predict_false(bbr->rc_in_persist != 0)) {
 		/* In persist mode */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_PERSIST);
 		return (0);
 	}
 	if (bbr->r_ctl.rc_sacked) {
 		/* We have sack holes on our scoreboard */
+		BBR_FASTACK_BAIL(BBR_SDT_FA_SACKED);
 		return (0);
 	}
 	/* Ok if we reach here, we can process a fast-ack */
@@ -8720,6 +9048,7 @@ bbr_fastack(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	}
 	return (1);
 }
+#undef BBR_FASTACK_BAIL
 
 /*
  * Return value of 1, the TCB is unlocked and most
@@ -10144,6 +10473,7 @@ bbr_init(struct tcpcb *tp, void **ptr)
 	    ((tp->t_srtt >> 2) + tp->t_rttvar) >> 1,
 	    tp->t_rttmin, tcp_rexmit_max);
 	bbr_start_hpts_timer(bbr, tp, cts, 5, 0, 0);
+	BBR_SDT(conn__init, bbr, cts, 0, 0, 0, 0);
 	return (0);
 }
 
@@ -10193,6 +10523,8 @@ bbr_fini(struct tcpcb *tp, int32_t tcb_is_purged)
 		bbr = (struct tcp_bbr *)tp->t_fb_ptr;
 		if (bbr->r_ctl.crte)
 			tcp_rel_pacing_rate(bbr->r_ctl.crte, bbr->rc_tp);
+		BBR_SDT(conn__fini, bbr, tcp_get_usecs(NULL), tcb_is_purged, 0,
+		    0, 0);
 		bbr_log_flowend(bbr);
 		bbr->rc_tp = NULL;
 		if (bbr->bbr_hdrw_pacing)
@@ -11362,6 +11694,8 @@ bbr_do_segment_nounlock(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th,
 	 */
 	if ((tp->t_flags & TF_RCVD_TSTMP) && !(to.to_flags & TOF_TS) &&
 	    ((thflags & TH_RST) == 0) && (V_tcp_tolerate_missing_ts == 0)) {
+		BBR_SDT(input__drop, bbr, cts, BBR_SDT_ID_NO_TSTAMP,
+		    th->th_ack, 0, th->th_seq);
 		retval = 0;
 		m_freem(m);
 		goto done_with_input;
@@ -11496,6 +11830,8 @@ bbr_do_segment_nounlock(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th,
 	}
 	bbr_log_ack_event(bbr, th, &to, tlen, nsegs, cts, nxt_pkt, m);
 	if ((thflags & TH_SYN) && (thflags & TH_FIN) && V_drop_synfin) {
+		BBR_SDT(input__drop, bbr, cts, BBR_SDT_ID_SYN_FIN,
+		    th->th_ack, 0, th->th_seq);
 		retval = 0;
 		m_freem(m);
 		goto done_with_input;
@@ -11864,6 +12200,7 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 	int32_t isipv6;
 #endif
 	uint8_t app_limited = BBR_JR_SENT_DATA;
+	uint8_t nosend_why __sdt_used = BBR_SDT_NS_NONE;
 	bbr = (struct tcp_bbr *)tp->t_fb_ptr;
 	/* We take a cache hit here */
 	memcpy(&bbr->rc_tv, tv, sizeof(struct timeval));
@@ -11873,6 +12210,7 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 	tp->t_flags2 &= ~TF2_HPTS_CALLS;
 	so = inp->inp_socket;
 	sb = &so->so_snd;
+	BBR_SDT(output, bbr, cts, hpts_calling, 0, 0, 0);
 	if (tp->t_nic_ktls_xmit)
  		hw_tls = 1;
  	else
@@ -11926,6 +12264,9 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 				 * is needed to send. Lets just return and
 				 * let the timer-run off.
 				 */
+				BBR_SDT(nosend, bbr, cts,
+				    BBR_SDT_NS_TIMER_PENDING, hpts_calling, 0,
+				    0);
 				return (0);
 			}
 		}
@@ -11970,6 +12311,8 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 			 * course we are overdue.
 			 */
 			counter_u64_add(bbr_out_size[TCP_MSS_ACCT_INPACE], 1);
+			BBR_SDT(nosend, bbr, cts, BBR_SDT_NS_PACER,
+			    hpts_calling, 0, 0);
 			return (0);
 		}
 	}
@@ -12055,6 +12398,8 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 		retval = bbr_process_timers(tp, bbr, cts, hpts_calling);
 		if (retval != 0) {
 			counter_u64_add(bbr_out_size[TCP_MSS_ACCT_ATIMER], 1);
+			BBR_SDT(nosend, bbr, cts, BBR_SDT_NS_TIMER_DONE,
+			    hpts_calling, retval, 0);
 			/*
 			 * If timers want tcp_drop(), then pass error out,
 			 * otherwise suppress it.
@@ -12079,6 +12424,7 @@ bbr_output_wtime(struct tcpcb *tp, const struct timeval *tv)
 	    SEQ_GT(tp->snd_max, tp->snd_una) &&	/* initial SYN or SYN|ACK sent */
 	    (tp->t_rxtshift == 0)) {	/* not a retransmit */
 		len = 0;
+		nosend_why = BBR_SDT_NS_TFO;
 		goto just_return_nolock;
 	}
 	/*
@@ -12102,6 +12448,7 @@ again:
 	doing_retran_from = picked_up_retran = 0;
 #endif
 	error = 0;
+	nosend_why = BBR_SDT_NS_NONE;
 	tso = 0;
 	slot = 0;
 	mtu = 0;
@@ -12121,6 +12468,7 @@ recheck_resend:
 		rsm = bbr_alloc(bbr);
 		if (rsm == NULL) {
 			error = ENOMEM;
+			nosend_why = BBR_SDT_NS_NOMEM;
 			/* Lie to get on the hpts */
 			tot_len = tp->t_maxseg;
 			if (hpts_calling)
@@ -12238,6 +12586,7 @@ recheck_resend:
 			bbr->alloc_limit_reported = 1;
 			BBR_STAT_INC(bbr_alloc_limited_conns);
 		}
+		nosend_why = BBR_SDT_NS_MAPLIMIT;
 		goto just_return_nolock;
 	}
 #ifdef BBR_INVARIANTS
@@ -12334,6 +12683,7 @@ recheck_resend:
 				 * segment.
 				 */
 				len = 0;
+				nosend_why = BBR_SDT_NS_SMALL;
 			}
 			if (bbr->rc_in_persist) {
 				/*
@@ -12481,6 +12831,7 @@ recheck_resend:
 			 * lets not send, and possibly enter persists.
 			 */
 			len = 0;
+			nosend_why = BBR_SDT_NS_RWND_SMALL;
 			if (tp->snd_max == tp->snd_una)
 				bbr_enter_persist(tp, bbr, cts, __LINE__);
 		} else if ((tp->snd_cwnd >= bbr->r_ctl.rc_pace_max_segs) &&
@@ -12500,6 +12851,7 @@ recheck_resend:
 			 */
 			bbr->rc_cwnd_limited = 1;
 			len = 0;
+			nosend_why = BBR_SDT_NS_CWND_SMALL;
 		} else if (((tp->snd_wnd - ctf_outstanding(tp)) <
 			    min((bbr->r_ctl.rc_high_rwnd/2), bbr_minseg(bbr))) &&
 			   (ctf_flight_size(tp, (bbr->r_ctl.rc_sacked +
@@ -12515,6 +12867,7 @@ recheck_resend:
 			 * its not a full pacing segment.
 			 */
 			len = 0;
+			nosend_why = BBR_SDT_NS_RWND_FULL;
 		}
 	}
 	/* len will be >= 0 after this point. */
@@ -12540,6 +12893,7 @@ recheck_resend:
 		if (sbleft >= min((bbr->r_ctl.rc_high_rwnd/2), bbr->r_ctl.rc_pace_max_segs)) {
 			/* not at end of sb lets not send */
 			len = 0;
+			nosend_why = BBR_SDT_NS_PERSIST_WAIT;
 		}
 	}
 	/*
@@ -12752,6 +13106,9 @@ just_return_nolock:
 	bbr->rc_output_starts_timer = 1;
 	bbr_start_hpts_timer(bbr, tp, cts, 9, slot, tot_len);
 	bbr_log_type_just_return(bbr, cts, tot_len, hpts_calling, app_limited, p_maxseg, len);
+	/* arg5: bytes this call sent, then the length it held back */
+	BBR_SDT(nosend, bbr, cts, nosend_why, hpts_calling, app_limited,
+	    ((uint64_t)tot_len << 32) | (uint32_t)len);
 	if (SEQ_LT(tp->snd_nxt, tp->snd_max)) {
 		/* Make sure snd_nxt is drug up */
 		tp->snd_nxt = tp->snd_max;
@@ -12787,6 +13144,8 @@ send:
 				if ((len == 0) && ((tp->t_flags & TF_ACKNOW) == 0)) {
 					/* Lets not send this */
 					slot = 0;
+					if (nosend_why == BBR_SDT_NS_NONE)
+						nosend_why = BBR_SDT_NS_FIN_WAIT;
 					goto just_return;
 				}
 			}
@@ -12920,6 +13279,8 @@ send:
 		if (V_tcp_udp_tunneling_port == 0) {
 			/* The port was removed?? */
 			SOCK_SENDBUF_UNLOCK(so);
+			BBR_SDT(output__error, bbr, cts, EHOSTUNREACH,
+			    bbr->oerror_cnt, len, 0);
 			return (EHOSTUNREACH);
 		}
 		hdrlen += sizeof(struct udphdr);
@@ -13053,6 +13414,8 @@ send:
 		 * We have outstanding data, don't send a fin by itself!.
 		 */
 		slot = 0;
+		if (nosend_why == BBR_SDT_NS_NONE)
+			nosend_why = BBR_SDT_NS_FIN_WAIT;
 		goto just_return;
 	}
 	/*
@@ -13126,6 +13489,8 @@ send:
 					BBR_STAT_INC(bbr_offset_drop);
 					SOCK_SENDBUF_UNLOCK(so);
 					(void)m_free(m);
+					BBR_SDT(output__error, bbr, cts, EFAULT,
+					    bbr->oerror_cnt, len, 0);
 					return (-EFAULT); /* tcp_drop() */
 				}
 				len = rsm->r_end - rsm->r_start;
@@ -13658,6 +14023,16 @@ out:
 				bbr->r_ctl.rc_tlp_rxt_last_time = cts;
 		}
 	}
+	/*
+	 * A send that failed before its header was built has no sequence
+	 * number.  arg5: TCP flags, then retransmit, tail loss probe, from
+	 * the scoreboard, TSO, called by the pacer, in persist.
+	 */
+	BBR_SDT(send, bbr, cts, (error != 0) ? 0 : bbr_seq, len, error,
+	    (uint32_t)(flags & 0xfff) | ((rsm != NULL) << 16) |
+	    ((doing_tlp != 0) << 17) | ((sack_rxmit != 0) << 18) |
+	    ((tso != 0) << 19) | (hpts_calling << 20) |
+	    (bbr->rc_in_persist << 21));
 	bbr_log_output(bbr, tp, &to, len, bbr_seq, (uint8_t) flags, error,
 	    cts, mb, &abandon, rsm, 0, sb);
 	if (abandon) {
@@ -13745,6 +14120,8 @@ nomore:
 		bbr->output_error_seen = 1;
 		if (bbr->oerror_cnt < 0xf)
 			bbr->oerror_cnt++;
+		BBR_SDT(output__error, bbr, cts, error, bbr->oerror_cnt, len,
+		    0);
 		if (bbr_max_net_error_cnt && (bbr->oerror_cnt >= bbr_max_net_error_cnt)) {
 			/* drop the session */
 			return (-ENETDOWN);
