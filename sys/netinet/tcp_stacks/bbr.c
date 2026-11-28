@@ -150,6 +150,12 @@ static int32_t bbr_cwndtarget_rtt_touse = BBR_RTT_PROP;
 static int32_t bbr_num_pktepo_for_del_limit = BBR_NUM_RTTS_FOR_DEL_LIMIT;
 static int32_t bbr_hardware_pacing_limit = 8000;
 static int32_t bbr_quanta = 3;	/* How much extra quanta do we get? */
+/*
+ * Test switch for the "gate by the sending rate" step of a b/w sample:
+ * 0 as it was, 1 time the sending rate from the earliest send that is
+ * not marked lost, 2 do not lower the sample to the sending rate.
+ */
+static int32_t bbr_sendrate_gate = 0;
 static int32_t bbr_no_retran = 0;
 
 static int32_t bbr_error_base_paceout = 10000; /* usec to pace */
@@ -1676,6 +1682,11 @@ bbr_init_sysctls(void)
 	    OID_AUTO, "quanta", CTLFLAG_RW,
 	    &bbr_quanta, 2,
 	    "Extra quanta to add when calculating the target (ID section 4.2.3.2).");
+	SYSCTL_ADD_S32(&bbr_sysctl_ctx,
+	    SYSCTL_CHILDREN(bbr_measure),
+	    OID_AUTO, "sendrate_gate", CTLFLAG_RW,
+	    &bbr_sendrate_gate, 0,
+	    "Test: sending-rate gate of a b/w sample: 0 as before, 1 timed from the earliest send not marked lost, 2 off");
 	SYSCTL_ADD_S32(&bbr_sysctl_ctx,
 	    SYSCTL_CHILDREN(bbr_measure),
 	    OID_AUTO, "noretran", CTLFLAG_RW,
@@ -5592,6 +5603,15 @@ bbr_get_earliest_send_outstanding(struct tcp_bbr *bbr, struct bbr_sendmap *u_rsm
 	struct bbr_sendmap *rsm;
 
 	rsm = TAILQ_FIRST(&bbr->r_ctl.rc_tmap);
+	if (bbr_sendrate_gate == 1) {
+		/*
+		 * What is marked lost is left out of the flight the gate
+		 * divides, so its send time does not start the gate's clock.
+		 */
+		while ((rsm != NULL) && (rsm != u_rsm) &&
+		    (rsm->r_flags & BBR_MARKED_LOST))
+			rsm = TAILQ_NEXT(rsm, r_tnext);
+	}
 	if ((rsm == NULL) || (u_rsm == rsm))
 		return (cts);
 	return(rsm->r_tim_lastsent[(rsm->r_rtr_cnt-1)]);
@@ -6839,7 +6859,7 @@ bbr_nf_measurement(struct tcp_bbr *bbr, struct bbr_sendmap *rsm, uint32_t rtt, u
 			sti = rsm->r_tim_lastsent[(rsm->r_rtr_cnt -1)] - rsm->r_first_sent_time;
 			sti += rsm->r_pacing_delay;
 			sbw /= sti;
-			if (sbw < bw) {
+			if ((sbw < bw) && (bbr_sendrate_gate != 2)) {
 				bbr_log_type_bbrupd(bbr, 6, cts,
 						    delivered,
 						    (uint32_t)sti,
@@ -6915,7 +6935,7 @@ bbr_google_measurement(struct tcp_bbr *bbr, struct bbr_sendmap *rsm, uint32_t rt
 			sti = rsm->r_tim_lastsent[(rsm->r_rtr_cnt -1)] - rsm->r_first_sent_time;
 			sti += rsm->r_pacing_delay;
 			sbw /= sti;
-			if (sbw < bw) {
+			if ((sbw < bw) && (bbr_sendrate_gate != 2)) {
 				bbr_log_type_bbrupd(bbr, 6, cts,
 						    delivered,
 						    (uint32_t)sti,
